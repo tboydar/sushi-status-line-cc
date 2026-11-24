@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck sushi-statusline.sh install.sh demo.sh tests/run.sh
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 測試會確認輸出不隨 locale 改變；Linux runner 預設沒有這幾個 locale，沒補的話那幾項會被略過
+      - name: 補上測試用的 locale（Linux）
+        if: runner.os == 'Linux'
+        run: sudo locale-gen de_DE.UTF-8 zh_TW.UTF-8 en_US.UTF-8
+
+      - name: 版本
+        run: |
+          bash --version | head -1
+          jq --version
+          git --version
+
+      - name: 測試（PATH 上的 bash）
+        run: bash tests/run.sh
+
+      # macOS 內附的 /bin/bash 停在 3.2，是這支腳本要支援的最舊版本
+      - name: 測試（macOS 內附的 bash 3.2）
+        if: runner.os == 'macOS'
+        run: /bin/bash tests/run.sh
