@@ -34,6 +34,7 @@ mkbin() {  # mkbin 目錄 指令...
 }
 mkbin "$WORK/bin"      jq git date mkdir mv
 mkbin "$WORK/bin-nojq" git date mkdir mv
+mkbin "$WORK/bin-nodate" jq git mkdir mv
 mkbin "$WORK/bin-gh"   jq git date mkdir mv sleep
 # 假的 gh：真的那支要網路和登入。每次呼叫記成一行（參數裡的查詢字串有換行，要壓平），
 # 再回傳 --jq 之後會得到的那一行。
@@ -69,6 +70,8 @@ sl() {  # sl 'JSON' [VAR=值 ...] → L1 L2 NLINES ERR RC
   { IFS= read -r L1; IFS= read -r L2; } <"$WORK/stdout"
   NLINES=$(wc -l <"$WORK/stdout" | tr -d ' ')
   ERR=$(cat "$WORK/stderr")
+  # $(...) 會吃掉結尾的換行；stderr 只有空行時也要算「有東西」
+  if [ -s "$WORK/stderr" ] && [ -z "$ERR" ]; then ERR='（stderr 只有換行）'; fi
 }
 
 GH_STUB_OUT='2 1'
@@ -209,6 +212,10 @@ t "極窄終端機：至少留 1 格，不會算出 0 格或負數"
 sl "$FULL" COLUMNS=5; clean
 eq "$(width "$L1")" 5
 
+t "COLUMNS 大得離譜：帶子最多 1000 格，不會一路算到超時"
+sl "$FULL" COLUMNS=100000; clean
+eq "$(width "$L1")" 3002
+
 t "SUSHI_SLOTS 固定格數，但不超過終端機寬度"
 sl "$FULL" SUSHI_SLOTS=10;             eq "$(width "$L1")" 32
 sl "$FULL" SUSHI_SLOTS=10 COLUMNS=200; eq "$(width "$L1")" 32
@@ -283,6 +290,13 @@ GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$C1_DIR" symboli
 sl '{"cwd":"'"$WORK"'/c1\u009brepo","model":{"display_name":"X"}}'; clean
 hasnt "$L2" $'\xc2\x9b'
 has "$L2" '🌿 main | '
+
+t "cwd 含 tab：只有換行沒辦法一行送過來，tab 不該讓 git 那段消失"
+TAB_DIR="$WORK/tab"$'\t'"dir"; mkdir -p "$TAB_DIR"
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$TAB_DIR" init -q
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$TAB_DIR" symbolic-ref HEAD refs/heads/main
+sl '{"cwd":"'"$WORK"'/tab\tdir","model":{"display_name":"X"}}'; clean
+has "$L2" '📁 tab dir | 🌿 main | '
 
 t "沒給 cwd 時退回 \$PWD：資料夾名稱裡的控制字元與換行一樣濾掉"
 ESC_DIR="$WORK/esc"$'\e'"[31mRED"; mkdir -p "$ESC_DIR"
@@ -417,6 +431,12 @@ sl "$SJ" TMPDIR="$WORK/tmp2" SUSHI_NOW=$((NOW + 50)); clean
 has "$L2" '🌿 main (+2) | '
 eq "$(find "$WORK/victim" -mindepth 1 | wc -l | tr -d ' ')" 0
 
+t "git 快取檔的內容印出來之前一樣要濾控制字元"
+printf '%s\n%s\n%s\n' "$NOW" "$REPO" $'🌿 main \e[31mRED' >"$WORK/cache/sushi-statusline-$(id -u)/git-planted"
+sl '{"session_id":"planted","cwd":"'"$REPO"'","model":{"display_name":"X"}}'; clean
+hasnt "$L2" $'\e'
+has "$L2" '🌿 main [31mRED | '
+
 t "git 很慢、render 被中途砍掉：之後的 render 不會再卡在 git 上"
 # Claude Code 會在下一次更新到來時砍掉還在跑的 render。沒有先佔位的話快取永遠寫不進去，每次都重跑 git、每次都被砍
 SLOWJ='{"session_id":"slow-1","cwd":"'"$REPO"'","model":{"display_name":"X"}}'
@@ -477,6 +497,12 @@ for extra in SUSHI_GH=0 "$OLD_PRINTF"; do
   sl "$FULL" SUSHI_NOW= "$extra"; clean
   case $L2 in *' | 🕐'[0-2][0-9]:[0-5][0-9]:[0-5][0-9]) ok ;; *) no "時鐘格式不對：[$L2]" ;; esac
 done
+
+t "時間格式化不出來（舊 bash 又沒有 date）：整段 🕐 與 ↻ 不顯示，不留光禿禿的圖示"
+sl "$FULL" PATH="$WORK/bin-nodate" "$OLD_PRINTF"; clean
+eq "$L2" '📁 proj | 🥢 Opus 4.7 | 💰$0.1234 | 📐26% | 🟢 5h:12% 7d:35%'
+sl "$FULL" PATH="$WORK/bin-nodate" "$OLD_PRINTF" SUSHI_NOW=; clean
+hasnt "$L2" '🕐'
 
 t "date 退回路線不會被目前目錄裡「檔名剛好是那個 epoch」的檔案騙走"   # GNU / busybox 的 date -r 是讀檔案的 mtime
 mkdir -p "$WORK/epoch"; touch -t 202001010000 "$WORK/epoch/1795010000"
@@ -559,6 +585,14 @@ else
   eq "$(gh_calls 'name=readonly')" 0
   chmod 700 "$RO"
 fi
+
+t "GitHub 數量：SUSHI_GH_TTL 設得再小，也至少隔 60 秒才重查"   # 設成 0 不該變成每秒打一次 API
+TTLJ='{"cwd":"'"$P"'","workspace":{"repo":{"host":"github.com","owner":"octo","name":"ttl0"}}}'
+ghsl "$TTLJ" SUSHI_GH_TTL=0; wait_calls 'name=ttl0' 1
+ghsl "$TTLJ" SUSHI_GH_TTL=0 SUSHI_NOW=$((NOW + 1)); ghsl "$TTLJ" SUSHI_GH_TTL=0 SUSHI_NOW=$((NOW + 59)); sleep 0.4
+eq "$(gh_calls 'name=ttl0')" 1
+ghsl "$TTLJ" SUSHI_GH_TTL=0 SUSHI_NOW=$((NOW + 60)); wait_calls 'name=ttl0' 2
+eq "$(gh_calls 'name=ttl0')" 2
 
 t "GitHub 數量：不是 github.com、SUSHI_GH=0、owner 有怪字元 → 完全不呼叫 gh"
 calls_before=$(gh_calls)
@@ -669,6 +703,8 @@ snippet=$("$BASH" "$SPACED/install.sh" --json 2>/dev/null)
 t "install.sh 不帶參數：只印說明，不碰 ~/.claude"
 out=$(HOME="$WORK/home" "$BASH" "$SPACED/install.sh" 2>&1); eq "$?" 0
 if [ -e "$WORK/home" ]; then no "install.sh 動了 HOME"; else ok; fi
+# 說明裡叫人執行的 demo 路徑含空白，要加引號才能直接複製貼上（cd && pwd 是為了和 install.sh 一樣把 // 收成 /）
+has "$out" "  '$(cd "$SPACED" && pwd)/demo.sh'"
 # 說明裡給人複製的片段：從 "statusLine" 到縮排兩格的 }，外面包一層 {} 要等於 --json 的結果
 fragment=$(printf '%s\n' "$out" | sed -n '/^  "statusLine"/,/^  }$/p')
 eq "$(printf '{%s}' "$fragment" | jq -c . 2>&1)" "$(printf '%s' "$snippet" | jq -c .)"

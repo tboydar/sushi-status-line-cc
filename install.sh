@@ -23,15 +23,19 @@ fi
 
 chmod +x "$SCRIPT" "$DEMO" 2>/dev/null || true
 
-# Claude Code 會把 command 整串交給 shell 執行，所以路徑裡有空白或特殊字元時
-# 要先包成單引號字串（' 本身寫成 '\''），再交給 jq 做 JSON 跳脫。
+# shq 路徑 → REPLY：路徑裡有空白或特殊字元時包成單引號字串（' 本身寫成 '\''），可以直接貼進 shell。
 # 取代用的字串先放進變數：直接在 ${…//…/…} 裡寫反斜線，各版 bash 的解讀不一樣。
 SQ="'"
 SQ_ESCAPED="'\\''"
-case $SCRIPT in
-  *[!A-Za-z0-9_./-]*) COMMAND="'${SCRIPT//$SQ/$SQ_ESCAPED}'" ;;
-  *) COMMAND=$SCRIPT ;;
-esac
+shq() {
+  case $1 in
+    *[!A-Za-z0-9_./-]*) REPLY="'${1//$SQ/$SQ_ESCAPED}'" ;;
+    *) REPLY=$1 ;;
+  esac
+}
+# Claude Code 會把 command 整串交給 shell 執行，所以先做 shell 引號，再交給 jq 做 JSON 跳脫
+shq "$SCRIPT"; COMMAND=$REPLY
+shq "$DEMO";   DEMO_COMMAND=$REPLY
 SNIPPET=$(jq -n --arg command "$COMMAND" \
   '{statusLine: {type: "command", command: $command, refreshInterval: 1}}')
 
@@ -61,6 +65,6 @@ cat <<EOF
   4. 重啟 Claude Code session
 
 想先看效果？
-  $DEMO
+  $DEMO_COMMAND
 
 EOF
