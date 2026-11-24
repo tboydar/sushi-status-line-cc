@@ -11,6 +11,7 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
@@ -22,6 +23,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -35,6 +37,7 @@ jobs:
           bash --version | head -1
           jq --version
           git --version
+          python3 --version
 
       - name: 測試（PATH 上的 bash）
         run: bash tests/run.sh
@@ -43,3 +46,25 @@ jobs:
       - name: 測試（macOS 內附的 bash 3.2）
         if: runner.os == 'macOS'
         run: /bin/bash tests/run.sh
+
+  # musl + busybox：date、mkdir、mv 都是 busybox 的版本，和 GNU / BSD 的旗標不完全一樣
+  test-alpine:
+    runs-on: ubuntu-latest
+    container: alpine:3
+    timeout-minutes: 10
+    steps:
+      # checkout 之前先裝 git，否則 actions/checkout 會改用下載壓縮檔的方式
+      - name: 安裝工具
+        run: apk add --no-cache bash jq git python3
+
+      - uses: actions/checkout@v4
+
+      - name: 版本
+        run: |
+          bash --version | head -1
+          jq --version
+          git --version
+          python3 --version
+
+      - name: 測試
+        run: bash tests/run.sh
