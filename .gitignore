@@ -11,8 +11,5 @@ assets/*.webm
 *.swp
 *~
 
-# Cache from any memory-aware variant
-/tmp/omc-memory-sushi.cache
-
 # OMC session state (should never be committed)
 .omc/
