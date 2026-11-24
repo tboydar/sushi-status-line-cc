@@ -1,126 +1,391 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # 🍣 Sushi Conveyor Belt Status Line for Claude Code
 # 每秒 L→R 滾動的迴轉壽司 status line。
 # Docs: see README.md in the same folder.
+#
+# 每次 render 最多 fork：jq 一次、git 一次（有快取，預設 5 秒才問一次）、
+# date 一到兩次（只有 bash < 4.2 需要）。其餘全部是 bash 內建。
 
-input=$(cat)
+# Claude Code 把終端機寬度放在 COLUMNS。bash 可能在跑完外部指令後自己改寫它，
+# 所以趁還沒 fork 任何東西先抄下來。
+TERM_COLS=${COLUMNS:-0}
+
+# 字串一律當 bytes 處理：行為不隨使用者的 locale 改變（zh_TW 的定序會讓 [...] 多吃字、
+# de_DE 的小數點是逗號），子行程的輸出也固定。
+export LC_ALL=C
+set -f   # 不做檔名展開：下面有幾處刻意不加引號來切字
 
 # ═══════════════════════════════════════════
-# Tunables
+# Tunables — 直接改預設值，或用 SUSHI_* 環境變數覆寫（不必動這個檔案）
 # ═══════════════════════════════════════════
-SLOTS_VISIBLE=30      # 帶子長度（slot 數）
-EMPTY_PROB=65         # % 空格機率（越高越稀疏）
-
-# 🍣 壽司 emoji 池，自行替換口味
-SUSHI=("🍣" "🍱" "🍤" "🍙" "🍥" "🐙" "🍵" "🦐" "🥟" "🦑" "🍶" "🍘")
+SLOTS_VISIBLE=${SUSHI_SLOTS:-0}       # 帶子格數；0 = 自動貼齊終端機寬度（拿不到寬度時 30 格）
+EMPTY_PROB=${SUSHI_EMPTY_PROB:-65}    # % 空格機率（越高越稀疏）
+MARGIN=${SUSHI_MARGIN:-4}             # 終端機寬度要扣掉的邊。settings.json 有設 padding 就再加 2×padding
+GIT_TTL=${SUSHI_GIT_TTL:-5}           # git 狀態快取秒數；0 = 每次都問 git
+SHOW_GH=${SUSHI_GH:-1}                # 1 = 用 gh 查 GitHub 的 open issue / PR 數量；0 = 關掉
+GH_TTL=${SUSHI_GH_TTL:-300}           # GitHub 數量快取秒數
+# 終端機太窄時，資訊列依這個順序一次拿掉一段（📁 永遠留著）
+DROP_ORDER=${SUSHI_DROP_ORDER:-time cost pr gh model rate ctx git}
+# 🍣 壽司 emoji 池，自行替換口味（每個都要是 2 欄寬的 emoji）
+# shellcheck disable=SC2206  # 刻意不加引號：用空白切成陣列（上面已 set -f，不會展開檔名）
+SUSHI=(${SUSHI_EMOJI:-🍣 🍱 🍤 🍙 🍥 🐙 🍵 🦐 🥟 🦑 🍶 🍘})
 NUM_SUSHI=${#SUSHI[@]}
+
+# uint 值 預設 → REPLY：不是非負整數（或長得離譜）就用預設值，後面的算術才不會噴錯
+uint() {
+  case $1 in
+    '' | *[!0-9]* | ????????????????*) REPLY=$2 ;;
+    *) REPLY=$((10#$1)) ;;
+  esac
+}
+uint "$TERM_COLS" 0;      TERM_COLS=$REPLY
+uint "$SLOTS_VISIBLE" 0;  SLOTS_VISIBLE=$REPLY
+uint "$EMPTY_PROB" 65;    EMPTY_PROB=$REPLY
+uint "$MARGIN" 4;         MARGIN=$REPLY
+uint "$GIT_TTL" 5;        GIT_TTL=$REPLY
+uint "$GH_TTL" 300;       GH_TTL=$REPLY
+[ "$SLOTS_VISIBLE" -gt 1000 ] && SLOTS_VISIBLE=1000
+
+# ═══════════════════════════════════════════
+# 時間
+# ═══════════════════════════════════════════
+# fmt_time 格式 epoch → REPLY。bash ≥ 4.2 有內建的 printf %(...)T，不用 fork；
+# macOS 內附的 bash 3.2 沒有，退回 date（BSD 吃 -r <epoch>，GNU / busybox 吃 -d @<epoch>）
+fmt_time() {
+  printf -v REPLY "%($1)T" "$2" 2>/dev/null && return
+  # 先 cd /：GNU 的 date -r 是「讀檔案的 mtime」，目前目錄裡要是剛好有個檔名等於這個 epoch 的檔案，
+  # 它就會成功並給出錯的時間，輪不到後面的 -d。根目錄不是別人放得了檔案的地方。
+  REPLY=$(cd / 2>/dev/null; date -r "$2" "+$1" 2>/dev/null || date -d "@$2" "+$1" 2>/dev/null)
+  [ -n "$REPLY" ]
+}
+
+uint "${SUSHI_NOW:-}" ""
+if [ -n "$REPLY" ]; then                # SUSHI_NOW：把「現在」釘在指定的 epoch（測試、截圖用）
+  NOW=$REPLY; fmt_time '%H:%M:%S' "$NOW"; CLOCK=$REPLY
+else
+  printf -v REPLY '%(%s %H:%M:%S)T' -1 2>/dev/null || REPLY=$(date '+%s %H:%M:%S')
+  NOW=${REPLY%% *}; CLOCK=${REPLY#* }
+fi
+uint "$NOW" 0; NOW=$REPLY
 
 # ═══════════════════════════════════════════
 # 一次 jq 讀完所有欄位
-# 一欄一行、逐行讀進陣列：空值也會佔一行，不會被吃掉
-# （bash 的 read 以空白為 IFS，會把連續 tab 併成一個，故不用 tab 分隔）
+#   · 一欄一行，沒有值就印空行，後面的欄位才不會往前擠
+#   · 數字在 jq 裡就四捨五入成整數（jq 不看 locale，bash 之後只做整數運算）
+#   · 字串裡的控制字元換成空白：值裡有換行也不會多出一行；C1（U+0080–9F）與雙向覆寫字元
+#     也一併處理，資料夾名稱之類的外來字串不能拿來操控終端機
+#   · 欄位不存在或型別不對一律當成沒有（at 會吞掉 getpath 的錯誤）
 # ═══════════════════════════════════════════
-F=()
-while IFS= read -r line; do
-  F+=("$line")
-done < <(echo "$input" | jq -r '
-  .cwd // .workspace.current_dir // "",
-  .model.display_name // "N/A",
-  .cost.total_cost_usd // 0,
-  .context_window.context_window_size // 0,
-  .context_window.current_usage.input_tokens // 0,
-  .context_window.current_usage.cache_creation_input_tokens // 0,
-  .context_window.current_usage.cache_read_input_tokens // 0,
-  .rate_limits.five_hour.used_percentage // "",
-  .rate_limits.seven_day.used_percentage // "",
-  .rate_limits.five_hour.resets_at // ""
-')
-CURRENT_DIR="${F[0]}"; MODEL="${F[1]}"; COST="${F[2]}"
-CTX_SIZE="${F[3]}"; CTX_IN="${F[4]}"; CTX_CC="${F[5]}"; CTX_CR="${F[6]}"
-RATE_5H="${F[7]}"; RATE_7D="${F[8]}"; RATE_5H_RESET="${F[9]}"
+{
+  IFS= read -r CWD;      IFS= read -r MODEL;    IFS= read -r SESSION
+  IFS= read -r COST_E4;  IFS= read -r CTX_PCT
+  IFS= read -r RATE_5H;  IFS= read -r RESET_5H
+  IFS= read -r RATE_7D;  IFS= read -r RESET_7D
+  IFS= read -r PR_NUM;   IFS= read -r PR_STATE
+  IFS= read -r GH_HOST;  IFS= read -r GH_OWNER; IFS= read -r GH_NAME
+} < <(jq -r '
+  def at(p): try getpath(p) catch null;
+  def text:  if type == "string" then
+               ( explode
+               | map(if . < 32 or (. >= 127 and . <= 159)                        # C0、DEL、C1
+                        or . == 8206 or . == 8207                               # LRM / RLM
+                        or (. >= 8234 and . <= 8238) or (. >= 8294 and . <= 8297) # 雙向嵌入、覆寫、隔離
+                     then 32 else . end)
+               | implode )
+             else "" end;
+  def num:   if type == "number" then . else 0 end;
+  def int:   if type == "number" then (. + 0.5 | floor) else "" end;
+
+  ((at(["workspace", "current_dir"]) | strings) // at(["cwd"]) | text),
+  (at(["model", "display_name"]) | text),
+  (at(["session_id"]) | text),
+  (at(["cost", "total_cost_usd"]) | num * 10000 | int),
+  ( at(["context_window", "used_percentage"]) as $official
+    | if ($official | type) == "number" then $official
+      else
+        # 舊版 Claude Code 沒有 used_percentage，照官方同一條公式自己算（只算 input 與兩種 cache）
+        (at(["context_window", "context_window_size"]) | num) as $size
+        | if $size > 0 then
+            ( (at(["context_window", "current_usage", "input_tokens"]) | num)
+            + (at(["context_window", "current_usage", "cache_creation_input_tokens"]) | num)
+            + (at(["context_window", "current_usage", "cache_read_input_tokens"]) | num) ) * 100 / $size
+          else 0 end
+      end
+    | int ),
+  (at(["rate_limits", "five_hour", "used_percentage"]) | int),
+  (at(["rate_limits", "five_hour", "resets_at"]) | int),
+  (at(["rate_limits", "seven_day", "used_percentage"]) | int),
+  (at(["rate_limits", "seven_day", "resets_at"]) | int),
+  (at(["pr", "number"]) | int),
+  (at(["pr", "review_state"]) | text),
+  (at(["workspace", "repo", "host"]) | text),
+  (at(["workspace", "repo", "owner"]) | text),
+  (at(["workspace", "repo", "name"]) | text)
+' 2>/dev/null)
+
+# jq 一定會印出花費那一行；連它都沒有，代表 jq 沒跑起來，或輸入根本不是 JSON
+NOTE=""
+if [ -z "$COST_E4" ]; then
+  command -v jq >/dev/null 2>&1 || NOTE="❗ 找不到 jq，請先安裝"
+fi
+[ -z "$MODEL" ] && MODEL="N/A"
+[ -z "$CWD" ] && CWD=$PWD
+
+uint "$COST_E4" 0;   COST_E4=$REPLY
+uint "$CTX_PCT" 0;   CTX_PCT=$REPLY
+uint "$RATE_5H" "";  RATE_5H=$REPLY
+uint "$RESET_5H" ""; RESET_5H=$REPLY
+uint "$RATE_7D" "";  RATE_7D=$REPLY
+uint "$RESET_7D" ""; RESET_7D=$REPLY
+uint "$PR_NUM" "";   PR_NUM=$REPLY
 
 # ═══════════════════════════════════════════
 # 建構輸送帶
 # 核心：slot 內容 = f(position - NOW)
 #   NOW 每秒 +1，同一內容會出現在右邊一格 → L→R，無需保存 state
+# 每格固定 3 欄（═══ 或「壽司 + ═」），帶子總寬恆為 3 × 格數 + 2，才能精準貼齊終端機
 # ═══════════════════════════════════════════
-NOW=$(date +%s)
+MAX_W=0   # 一行最多能用幾欄；0 = 不知道終端機多寬
+if [ "$TERM_COLS" -gt 0 ]; then
+  MAX_W=$((TERM_COLS - MARGIN))
+  [ "$MAX_W" -lt 1 ] && MAX_W=1
+fi
 
-# bash 的 % 保留被除數正負號；我們要純正數 mod
-pos_mod() { echo $(( (($1 % $2) + $2) % $2 )); }
+SLOTS=$SLOTS_VISIBLE
+if [ "$MAX_W" -gt 0 ]; then
+  FIT=$(( (MAX_W - 2) / 3 ))
+  [ "$FIT" -lt 1 ] && FIT=1
+  if [ "$SLOTS" -eq 0 ] || [ "$SLOTS" -gt "$FIT" ]; then SLOTS=$FIT; fi
+elif [ "$SLOTS" -eq 0 ]; then
+  SLOTS=30
+fi
+[ "$NUM_SUSHI" -eq 0 ] && EMPTY_PROB=100
 
 BELT="▸"
-for ((p=0; p<SLOTS_VISIBLE; p++)); do
-  slot_id=$(( p - NOW ))
-  # hash1：這個 slot 是空格還是壽司？
-  h1=$(pos_mod $(( slot_id * 2654435761 + 1013904223 )) 100)
-  if [ "$h1" -lt "$EMPTY_PROB" ]; then
-    BELT="${BELT}═══"
+for ((p = 0; p < SLOTS; p++)); do
+  # 整數雜湊（xor-shift 與乘法交替）：把連續的 slot_id 攪成看不出規律的 32-bit 數。
+  # 只做「乘大質數再取餘數」不夠——對連續整數那只是等差數列，壽司會照池子順序輪播。
+  # 乘數 < 2^27、h < 2^32，乘積不會超過 bash 的 64-bit 整數。
+  h=$(( (p - NOW) & 0xFFFFFFFF ))
+  h=$(( (((h >> 16) ^ h) * 0x45D9F3B) & 0xFFFFFFFF ))
+  h=$(( (((h >> 16) ^ h) * 0x45D9F3B) & 0xFFFFFFFF ))
+  h=$(( (h >> 16) ^ h ))
+  # 同一個 h 的餘數與商各管一件事：這格空不空、放哪一盤
+  if (( h % 100 < EMPTY_PROB )); then
+    BELT+="═══"
   else
-    # hash2：用獨立常數另外挑壽司，避免和 h1 相關
-    h2=$(pos_mod $(( slot_id * 374761393 + 668265263 )) "$NUM_SUSHI")
-    BELT="${BELT}${SUSHI[$h2]}"
+    BELT+="${SUSHI[h / 100 % NUM_SUSHI]}═"
   fi
 done
-BELT="${BELT}▸"
+BELT+="▸"
 
 # ═══════════════════════════════════════════
-# 資訊列：資料夾、git、model、cost、context、rate、時間
+# 資訊列各段
 # ═══════════════════════════════════════════
-[ -z "$CURRENT_DIR" ] && CURRENT_DIR=$(pwd)
-FOLDER_NAME=$(basename "$CURRENT_DIR")
+FOLDER=${CWD%"${CWD##*[!/]}"}   # 去掉尾端所有的 /
+FOLDER=${FOLDER##*/}
+[ -z "$FOLDER" ] && FOLDER=/
 
-# git -C 而非 cd：不改動本行程的工作目錄
-GIT_INFO=""
-if [ -d "$CURRENT_DIR" ] && git -C "$CURRENT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  BRANCH=$(git -C "$CURRENT_DIR" branch --show-current 2>/dev/null)
-  [ -z "$BRANCH" ] && BRANCH=$(git -C "$CURRENT_DIR" rev-parse --short HEAD 2>/dev/null)
-  STAGED=$(git -C "$CURRENT_DIR" diff --cached --numstat 2>/dev/null | wc -l | tr -d ' ')
-  UNSTAGED=$(git -C "$CURRENT_DIR" diff --numstat 2>/dev/null | wc -l | tr -d ' ')
-  UNTRACKED=$(git -C "$CURRENT_DIR" ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')
-  TOTAL=$((STAGED + UNSTAGED + UNTRACKED))
-  if [ "$TOTAL" -gt 0 ]; then
-    GIT_INFO="🌿 $BRANCH (+$TOTAL)"
-  else
-    GIT_INFO="🌿 $BRANCH"
+# 快取放在自己擁有的目錄裡。/tmp 是共用的，別人先建好的同名目錄或 symlink 一律不用。
+CACHE_DIR=${TMPDIR:-/tmp}
+CACHE_DIR=${CACHE_DIR%/}/sushi-statusline-${UID:-0}
+have_cache() {
+  [ -d "$CACHE_DIR" ] || mkdir -m 700 "$CACHE_DIR" 2>/dev/null
+  [ -d "$CACHE_DIR" ] && [ ! -L "$CACHE_DIR" ] && [ -O "$CACHE_DIR" ]
+}
+# put 檔案 行...：寫到暫存檔再 mv。同一個檔案系統內的 mv 是原子操作，
+# 同時在讀的另一個 render 只會看到舊的或新的，不會讀到寫一半的。
+# （2>/dev/null 放前面：轉向由左至右生效，開檔失敗的訊息才會被吃掉）
+put() {
+  local file=$1; shift
+  printf '%s\n' "$@" 2>/dev/null >"$file~$$" && mv -f "$file~$$" "$file" 2>/dev/null
+}
+
+# ── 🌿 git ──
+# 一次 git status 拿到分支和所有變動（同一個檔案又暫存又再改只算一次）。
+# GIT_OPTIONAL_LOCKS=0：不順手回寫 index，每秒 render 才不會和 Claude 正在跑的 git 搶 index.lock。
+# core.fsmonitor=false：repo 自己的 .git/config 可以把 fsmonitor 設成任意指令，git status 會去執行它；
+# 這裡是無人看管、每幾秒自動跑一次，不該替一個剛解壓縮的專案執行它指定的程式。
+git_info() {
+  GIT_INFO=""
+  [ -d "$CWD" ] || return 0
+  local line branch="" oid="" dirty=0
+  while IFS= read -r line; do
+    case $line in
+      '# branch.head '*) branch=${line#'# branch.head '} ;;
+      '# branch.oid '*)  oid=${line#'# branch.oid '} ;;
+      '#'*) ;;
+      # 數到 1000 就停：沒 ignore 的 node_modules 可以有好幾萬行，bash 逐行數完要好幾秒，
+      # 拖過 refreshInterval 整個 render 會被 Claude Code 砍掉，status line 就永遠出不來
+      ?*) dirty=$((dirty + 1)); [ "$dirty" -ge 1000 ] && break ;;
+    esac
+  done < <(GIT_OPTIONAL_LOCKS=0 git -c core.fsmonitor=false -C "$CWD" \
+             status --porcelain=v2 --branch --untracked-files=all 2>/dev/null)
+  [ -n "$branch" ] || return 0   # 不是 git repo（或沒裝 git）
+  [ "$branch" = "(detached)" ] && branch=${oid:0:7}
+  # git 不准分支名有 ASCII 控制字元，但准 C1 控制字元（C2 80–9F）與雙向覆寫字元（E2 80 8E/8F/AA–AE、E2 81 A6–A9）
+  branch=${branch//$'\xC2'[$'\x80'-$'\x9F']/}
+  branch=${branch//$'\xE2\x80'[$'\x8E\x8F\xAA'-$'\xAE']/}
+  branch=${branch//$'\xE2\x81'[$'\xA6'-$'\xA9']/}
+  GIT_INFO="🌿 $branch"
+  if [ "$dirty" -ge 1000 ]; then GIT_INFO="$GIT_INFO (+999+)"
+  elif [ "$dirty" -gt 0 ]; then GIT_INFO="$GIT_INFO (+$dirty)"; fi
+}
+
+# 官方文件建議快取 git：GIT_TTL 秒內的 render 直接讀檔，完全不 fork（代價是 +N 最多慢 GIT_TTL 秒）。
+# 一個 session 一個檔，檔內記著時間與目錄；時間戳寫在內容裡，就不必用 BSD / GNU 寫法不同的 stat。
+GIT_INFO=""; GIT_CACHE=""; GIT_HIT=""
+case $SESSION in
+  '' | *[!A-Za-z0-9_-]*) ;;   # 沒有 session_id、或它不適合當檔名：不快取
+  *) if [ "$GIT_TTL" -gt 0 ] && have_cache; then GIT_CACHE="$CACHE_DIR/git-$SESSION"; fi ;;
+esac
+STALE=""   # 同一個目錄上一次的結果，過期了但還能先頂著用
+if [ -n "$GIT_CACHE" ] && [ -f "$GIT_CACHE" ]; then
+  C_TS=""; C_DIR=""; C_INFO=""
+  { IFS= read -r C_TS; IFS= read -r C_DIR; IFS= read -r C_INFO; } 2>/dev/null <"$GIT_CACHE"
+  uint "$C_TS" ""
+  if [ -n "$REPLY" ] && [ "$C_DIR" = "$CWD" ]; then
+    STALE=$C_INFO
+    if [ $((NOW - REPLY)) -ge 0 ] && [ $((NOW - REPLY)) -lt "$GIT_TTL" ]; then
+      GIT_INFO=$C_INFO; GIT_HIT=1
+    fi
   fi
 fi
-
-COST_FMT=$(printf "%.4f" "$COST")
-CTX_USED=$((CTX_IN + CTX_CC + CTX_CR))
-if [ "$CTX_SIZE" -gt 0 ] 2>/dev/null; then
-  CTX_PCT=$(awk "BEGIN {printf \"%.0f\", ($CTX_USED/$CTX_SIZE)*100}")
-else
-  CTX_PCT="0"
+if [ -z "$GIT_HIT" ]; then
+  # 先用舊結果佔位再去問 git。repo 大到 git status 跑超過 refreshInterval 時，這次 render 會被 Claude Code
+  # 砍掉；沒有佔位的話快取永遠寫不進去，之後每次 render 都重跑 git、每次都被砍，status line 就再也出不來。
+  [ -n "$GIT_CACHE" ] && put "$GIT_CACHE" "$NOW" "$CWD" "$STALE"
+  git_info
+  [ -n "$GIT_CACHE" ] && put "$GIT_CACHE" "$NOW" "$CWD" "$GIT_INFO"
 fi
 
-# unix epoch → HH:MM。BSD date 吃 -r，GNU date 吃 -d @；兩個都試才能跨平台
-fmt_hhmm() { date -r "$1" +"%H:%M" 2>/dev/null || date -d "@$1" +"%H:%M" 2>/dev/null; }
+# ── GitHub open issues / PRs ──
+# 每次 render 都打 API 太慢又吃額度：只讀快取；過期了就在背景用 gh 更新，這一輪先顯示舊值
+# （第一次沒有快取就先不顯示）。repo 身分用 Claude Code 從 origin 解析好的 workspace.repo。
+GH_INFO=""
+if [ "$SHOW_GH" = 1 ] && [ "$GH_HOST" = github.com ] && [ -n "$GH_OWNER" ] && [ -n "$GH_NAME" ]; then
+  case $GH_OWNER$GH_NAME in
+    *[!A-Za-z0-9._-]*) ;;   # 要拿來當檔名和 API 參數，只收 GitHub 名稱會有的字元
+    *)
+      if command -v gh >/dev/null 2>&1 && have_cache; then
+        GH_CACHE="$CACHE_DIR/gh-${GH_OWNER}__${GH_NAME}"
+        G_TS=""; G_ISSUES=""; G_PRS=""
+        [ -f "$GH_CACHE" ] && read -r G_TS G_ISSUES G_PRS 2>/dev/null <"$GH_CACHE"
+        uint "$G_TS" 0;      G_TS=$REPLY
+        uint "$G_ISSUES" ""; G_ISSUES=$REPLY
+        uint "$G_PRS" "";    G_PRS=$REPLY
+        [ -n "$G_ISSUES" ] && [ -n "$G_PRS" ] && GH_INFO="issues:${G_ISSUES}, PRs:${G_PRS}"
+        if [ $((NOW - G_TS)) -ge "$GH_TTL" ] || [ $((NOW - G_TS)) -lt 0 ]; then
+          # 先把時間戳更新（數字沿用舊的），之後的 render 和其他 session 就不會重複去查；
+          # 查詢失敗也一樣等 GH_TTL 才重試。
+          put "$GH_CACHE" "$NOW ${G_ISSUES:--} ${G_PRS:--}"
+          # stdio 全部切斷再丟背景：status line 不等網路，Claude Code 也不會等這個子行程
+          (
+            # shellcheck disable=SC2016  # $owner / $name 是 GraphQL 變數，不是 shell 變數
+            # -f 而不是 -F：-F 會把 123 這種名字當成數字送出去，GraphQL 的 String! 不收
+            counts=$(gh api graphql -f owner="$GH_OWNER" -f name="$GH_NAME" -f query='
+              query($owner:String!,$name:String!){repository(owner:$owner,name:$name){
+                issues(states:OPEN){totalCount} pullRequests(states:OPEN){totalCount}}}' \
+              --jq '"\(.data.repository.issues.totalCount) \(.data.repository.pullRequests.totalCount)"')
+            [[ $counts =~ ^[0-9]+\ [0-9]+$ ]] || exit 0
+            put "$GH_CACHE" "$NOW $counts"
+          ) </dev/null >/dev/null 2>&1 &
+        fi
+      fi
+      ;;
+  esac
+fi
 
+# ── 🔀 目前分支的 PR ──（Claude Code 直接給，不用外呼）
+PR_INFO=""
+if [ -n "$PR_NUM" ] && [ "$PR_NUM" -gt 0 ]; then
+  case $PR_STATE in
+    approved)                  PR_ICON=" ✅" ;;
+    changes_requested)         PR_ICON=" 💬" ;;
+    pending | review_required) PR_ICON=" 👀" ;;
+    draft)                     PR_ICON=" 📝" ;;
+    '' | *[!A-Za-z0-9_-]*)     PR_ICON="" ;;
+    *)                         PR_ICON=" $PR_STATE" ;;   # 之後才出現的新狀態：先照字面顯示
+  esac
+  PR_INFO="🔀#${PR_NUM}${PR_ICON}"
+fi
+
+# ── rate limit ──
+# 5h 與 7d 各自獨立：有的方案只送其中一個，所以不能把 7d 掛在 5h 底下。
 RATE_INFO=""
-if [ -n "$RATE_5H" ]; then
-  RATE_5H_INT=$(printf "%.0f" "$RATE_5H")
-  if [ "$RATE_5H_INT" -ge 80 ]; then RATE_ICON="🔴"
-  elif [ "$RATE_5H_INT" -ge 50 ]; then RATE_ICON="🟡"
-  else RATE_ICON="🟢"; fi
-  RATE_INFO="${RATE_ICON} 5h:${RATE_5H_INT}%"
-  if [ -n "$RATE_7D" ]; then
-    RATE_7D_INT=$(printf "%.0f" "$RATE_7D")
-    RATE_INFO="${RATE_INFO} 7d:${RATE_7D_INT}%"
-  fi
-  if [ -n "$RATE_5H_RESET" ]; then
-    RESET_TIME=$(fmt_hhmm "$RATE_5H_RESET")
-    [ -n "$RESET_TIME" ] && RATE_INFO="${RATE_INFO} ↻${RESET_TIME}"
+if [ -n "$RATE_5H" ] || [ -n "$RATE_7D" ]; then
+  # 燈號跟著比較滿的那個窗口：這週用到 95% 就是紅燈，即使 5h 窗口才 10%
+  LEAD=${RATE_5H:-0}
+  [ "${RATE_7D:-0}" -gt "$LEAD" ] && LEAD=$RATE_7D
+  if [ "$LEAD" -ge 80 ]; then RATE_INFO="🔴"
+  elif [ "$LEAD" -ge 50 ]; then RATE_INFO="🟡"
+  else RATE_INFO="🟢"; fi
+  [ -n "$RATE_5H" ] && RATE_INFO="$RATE_INFO 5h:${RATE_5H}%"
+  [ -n "$RATE_7D" ] && RATE_INFO="$RATE_INFO 7d:${RATE_7D}%"
+  # 5h 的重設頂多幾小時後，給時刻就夠；只有 7d 時可能是好幾天後，要帶日期
+  if [ -n "$RATE_5H" ]; then
+    [ -n "$RESET_5H" ] && fmt_time '%H:%M' "$RESET_5H" && RATE_INFO="$RATE_INFO ↻$REPLY"
+  elif [ -n "$RESET_7D" ]; then
+    fmt_time '%m/%d %H:%M' "$RESET_7D" && RATE_INFO="$RATE_INFO ↻$REPLY"
   fi
 fi
 
-TIME_NOW=$(date +"%H:%M:%S")
+printf -v COST '%d.%04d' $((COST_E4 / 10000)) $((COST_E4 % 10000))
 
-LINE2="📁 ${FOLDER_NAME}"
-[ -n "$GIT_INFO" ] && LINE2="$LINE2 | $GIT_INFO"
-LINE2="$LINE2 | 🥢 $MODEL | 💰\$$COST_FMT | 📐${CTX_PCT}%"
-[ -n "$RATE_INFO" ] && LINE2="$LINE2 | $RATE_INFO"
-LINE2="$LINE2 | 🕐$TIME_NOW"
+SEG_DIR="📁 $FOLDER"
+SEG_GIT=$GIT_INFO
+SEG_GH=$GH_INFO
+SEG_PR=$PR_INFO
+SEG_MODEL="🥢 $MODEL"
+SEG_COST="💰\$$COST"
+SEG_CTX="📐${CTX_PCT}%"
+SEG_RATE=$RATE_INFO
+SEG_TIME="🕐$CLOCK"
+if [ -n "$NOTE" ]; then SEG_MODEL=$NOTE; SEG_COST=""; SEG_CTX=""; fi
 
-echo "$BELT"
-echo "$LINE2"
+# ═══════════════════════════════════════════
+# 組合資訊列；終端機太窄就依 DROP_ORDER 一次拿掉一段
+# ═══════════════════════════════════════════
+join_line2() {
+  local seg
+  LINE2=$SEG_DIR
+  for seg in "$SEG_GIT" "$SEG_GH" "$SEG_PR" "$SEG_MODEL" "$SEG_COST" "$SEG_CTX" "$SEG_RATE" "$SEG_TIME"; do
+    [ -n "$seg" ] && LINE2="$LINE2 | $seg"
+  done
+}
+
+# disp_w 字串 → W（顯示寬度，欄）。字串是 UTF-8 bytes，用起始 byte 分類，不必 fork：
+#   ASCII 與 2-byte 字元（拉丁、希臘…）1 欄；3-byte（中日韓）與 4-byte（emoji）2 欄。
+#   ↻ 是 3-byte 卻只佔 1 欄，另外扣回來。其他窄的 3-byte 符號會多算 1 欄，寧可高估。
+disp_w() {
+  local s=$1 t
+  t=${s//[$'\x80'-$'\xBF']/}    # 拿掉接續 byte，剩下一個字元一個 byte
+  W=${#t}
+  t=${t//[$'\x01'-$'\xDF']/}    # 再拿掉 ASCII 與 2-byte 字元，剩下的都是寬字元
+  W=$((W + ${#t}))
+  t=${s//↻/}
+  W=$((W - (${#s} - ${#t}) / 3))
+}
+
+join_line2
+if [ "$MAX_W" -gt 0 ]; then
+  for drop in $DROP_ORDER; do
+    disp_w "$LINE2"
+    [ "$W" -le "$MAX_W" ] && break
+    case $drop in
+      time)  SEG_TIME="" ;;
+      cost)  SEG_COST="" ;;
+      pr)    SEG_PR="" ;;
+      gh)    SEG_GH="" ;;
+      model) SEG_MODEL="" ;;
+      rate)  SEG_RATE="" ;;
+      ctx)   SEG_CTX="" ;;
+      git)   SEG_GIT="" ;;
+      *)     continue ;;
+    esac
+    join_line2
+  done
+fi
+
+printf '%s\n%s\n' "$BELT" "$LINE2"
+exit 0   # exit code 不是 0 的話 Claude Code 會把整條 status line 清空
