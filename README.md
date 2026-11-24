@@ -58,6 +58,8 @@ Claude Code 的 status line 變成一條迴轉壽司輸送帶：每秒 🍣🍱�
 📁 my-project | 🌿 main (+3) | 📐26%
 ```
 
+資料夾名稱本身不會被截短。名稱長到連 `📁` 這一段都塞不下時，就交給 Claude Code 在行尾截斷並補上 `…`。
+
 > 想看動畫版？見本 repo `assets/demo.tape`，用 [vhs](https://github.com/charmbracelet/vhs) 可以自動產生 GIF。
 
 ---
@@ -295,13 +297,16 @@ status line 腳本的輸出是被 Claude Code 接走的，沒有接著終端機�
 - **變動檔案數到 1000 就停**（顯示 `(+999+)`）。沒有 ignore 的 `node_modules` 可以有好幾萬個未追蹤檔案，bash 逐行數完要好幾秒。
 - **問 git 之前先用舊結果佔住快取**。repo 大到 `git status` 本身就超時的話，那一次 render 會被砍，但接下來 5 秒內的 render 會直接用佔位的結果，不會每一次都重跑 git、每一次都被砍。
 
-### 不替外來的東西執行或顯示任何指令
+### 面對陌生的 repo
 
-status line 是無人看管、自動反覆執行的，資料夾名稱、分支名稱、repo 設定都可能來自一個剛解壓縮的陌生專案：
+status line 是無人看管、自動反覆執行的，資料夾名稱、分支名稱都可能來自一個剛解壓縮的陌生專案，所以：
 
-- 呼叫 git 時加上 `-c core.fsmonitor=false`。repo 自己的 `.git/config` 可以把 `core.fsmonitor` 設成任意指令，一般的 `git status` 會去執行它。
-- 所有要印出來的外來字串都先濾掉控制字元，包含 C1（U+0080–9F）與雙向覆寫字元（U+202E 等），不讓它們操控終端機或把畫面順序弄反。
+- 所有要印出來的外來字串都先濾掉控制字元，包含 C1（U+0080–9F）與雙向控制字元（U+202E 等），不讓它們操控終端機或把畫面順序弄反。
+- 濾過的路徑只拿來顯示；問檔案系統、問 git 用的是原本的路徑。兩者混用的話，濾過的結果可能剛好是另一個真實存在的目錄。
 - 拿來組檔名的值（`session_id`、repo 的 owner / name）只收固定的字元集，其餘一律當成沒有。
+- 呼叫 git 時加上 `-c core.fsmonitor=false`：repo 自己的 `.git/config` 可以把 `core.fsmonitor` 設成任意指令，一般的 `git status` 會去執行它。
+
+**最後一點只是少開一扇門，不是完整的防護。** git 還有別的設定會讓它執行外部程式（例如 clean filter，Git LFS 就是靠它，所以不能關），這支腳本擋不了。Git 官方的立場是：來源不可信的 `.git` 目錄，不該拿來執行任何 git 指令——這包括你的 shell 提示字元、Claude Code 自己，也包括這支腳本。別人給的壓縮檔裡如果帶著 `.git`，先確認內容再進去開 Claude Code。
 
 ### GitHub 的 issue / PR 數量
 

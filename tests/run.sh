@@ -260,6 +260,29 @@ sl '{"workspace":{"current_dir":"'"$P"'"},"model":{"display_name":"X"}}'; has "$
 sl '{"cwd":"'"$P"'//","model":{"display_name":"X"}}';      has "$L2" '📁 proj | '   # 尾端不只一個斜線
 sl '{"workspace":{"current_dir":123},"cwd":"'"$P"'","model":{"display_name":"X"}}'; has "$L2" '📁 proj | '   # current_dir 不是字串就看 cwd
 
+t "cwd 含換行：不會拿「換行變空白之後的路徑」去問 git，以免顯示到隔壁 repo 的分支"
+NL_DIR="$WORK/line"$'\n'"break"; mkdir -p "$NL_DIR" "$WORK/line break"
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$WORK/line break" init -q
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$WORK/line break" symbolic-ref HEAD refs/heads/WRONG_REPO
+sl '{"cwd":"'"$WORK"'/line\nbreak","model":{"display_name":"X"}}'; clean
+has "$L2" '📁 line break | 🥢 X'
+hasnt "$L2" 'WRONG_REPO'
+
+t "cwd 含 C1 控制字元：畫面上濾掉，但問 git 用的是原本的路徑"
+C1_DIR="$WORK/c1"$'\xc2\x9b'"repo"; mkdir -p "$C1_DIR"
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$C1_DIR" init -q
+GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$C1_DIR" symbolic-ref HEAD refs/heads/main
+sl '{"cwd":"'"$WORK"'/c1\u009brepo","model":{"display_name":"X"}}'; clean
+hasnt "$L2" $'\xc2\x9b'
+has "$L2" '🌿 main | '
+
+t "沒給 cwd 時退回 \$PWD：資料夾名稱裡的控制字元與換行一樣濾掉"
+ESC_DIR="$WORK/esc"$'\e'"[31mRED"; mkdir -p "$ESC_DIR"
+cd "$ESC_DIR" || exit 2; sl '{}'; cd "$START_DIR" || exit 2
+clean; hasnt "$L2" $'\e'; has "$L2" '📁 esc[31mRED | '
+cd "$NL_DIR" || exit 2; sl '{}'; cd "$START_DIR" || exit 2
+clean; has "$L2" '📁 linebreak | '
+
 t "context %：優先用官方的 used_percentage"
 sl '{"cwd":"'"$P"'","context_window":{"used_percentage":42.4,"context_window_size":200000,"current_usage":{"input_tokens":1000}}}'
 has "$L2" '📐42%'
@@ -498,6 +521,33 @@ for _ in 1 2 3 4; do ghsl "$BROKEN"; sleep 0.15; done
 clean; hasnt "$L2" 'issues:'
 eq "$(gh_calls 'name=broken')" 1
 GH_STUB_OUT='2 1'
+
+t "GitHub 數量：重查失敗後不再顯示舊數字，也一樣等 300 秒才重試"
+STALEJ='{"cwd":"'"$REPO"'","model":{"display_name":"X"},"workspace":{"repo":{"host":"github.com","owner":"octo","name":"stale"}}}'
+if wait_for 'issues:2, PRs:1' "$STALEJ"; then ok; else no "等不到第一次的數量"; fi
+GH_STUB_OUT='HTTP 401: Bad credentials'
+ghsl "$STALEJ" SUSHI_NOW=$((NOW + 300)); has "$L2" 'issues:2, PRs:1'     # 重查的這一輪還是舊值
+tries=0
+while [ "$tries" -lt 50 ]; do
+  ghsl "$STALEJ" SUSHI_NOW=$((NOW + 301)); case $L2 in *issues:*) ;; *) break ;; esac
+  sleep 0.1; tries=$((tries + 1))
+done
+hasnt "$L2" 'issues:'
+eq "$(gh_calls 'name=stale')" 2
+GH_STUB_OUT='2 1'
+
+t "GitHub 數量：快取寫不進去時不發查詢（否則會變成每秒打一次 API）"
+if [ "$(id -u)" = 0 ]; then
+  skip "root 不受目錄權限限制，做不出寫不進去的快取目錄"
+else
+  RO="$WORK/ro/sushi-statusline-$(id -u)"; mkdir -p "$RO"; chmod 500 "$RO"
+  for _ in 1 2 3; do
+    ghsl '{"cwd":"'"$P"'","workspace":{"repo":{"host":"github.com","owner":"octo","name":"readonly"}}}' TMPDIR="$WORK/ro"; clean
+  done
+  sleep 0.4
+  eq "$(gh_calls 'name=readonly')" 0
+  chmod 700 "$RO"
+fi
 
 t "GitHub 數量：不是 github.com、SUSHI_GH=0、owner 有怪字元 → 完全不呼叫 gh"
 calls_before=$(gh_calls)
