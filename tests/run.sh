@@ -76,9 +76,9 @@ ghsl() {  # 同 sl，但開啟 GitHub 數量、PATH 上有假的 gh
   local json=$1; shift
   sl "$json" PATH="$WORK/bin-gh" SUSHI_GH=1 GH_LOG="$WORK/gh.log" GH_STUB_OUT="$GH_STUB_OUT" "$@"
 }
-wait_for() {  # wait_for 字串 ghsl參數...：背景更新是非同步的，重跑到出現為止（最多約 5 秒）
+wait_for() {  # wait_for 字串 ghsl參數...：背景更新是非同步的，重跑到出現為止（最多約 10 秒）
   local want=$1 i=0; shift
-  while [ "$i" -lt 50 ]; do
+  while [ "$i" -lt 100 ]; do
     ghsl "$@"
     case $L2 in *"$want"*) return 0 ;; esac
     sleep 0.1; i=$((i + 1))
@@ -93,6 +93,14 @@ gh_calls() {  # gh_calls [字串]：假 gh 被呼叫幾次（可只算含某字�
   done <"$WORK/gh.log"
   echo "$n"
 }
+
+wait_calls() {  # wait_calls 字串 N：等到假 gh 被呼叫滿 N 次（它在背景啟動，什麼時候寫下紀錄看機器快慢）
+  local i=0
+  while [ "$(gh_calls "$1")" -lt "$2" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+}
+
+# 這份測試裡凡是「等背景的東西」都是等到事件真的發生（有上限），不用固定秒數的 sleep 去賭機器夠快。
+# 固定的 sleep 只用在「確認某件事沒有發生」，那種寫法頂多漏抓，不會在慢機器上誤判失敗。
 
 # ── 量測與斷言 ───────────────────────────────────────────
 width() {  # 顯示寬度（欄）
@@ -415,7 +423,9 @@ SLOWJ='{"session_id":"slow-1","cwd":"'"$REPO"'","model":{"display_name":"X"}}'
 printf '%s' "$SLOWJ" | env -i PATH="$WORK/bin-slowgit" TMPDIR="$WORK/cache" TZ=UTC SUSHI_NOW="$NOW" SUSHI_GH=0 \
   GIT_LOG="$WORK/git.log" "$BASH" "$SCRIPT" >/dev/null 2>&1 &
 slow_pid=$!
-sleep 0.6; kill "$slow_pid" 2>/dev/null; wait "$slow_pid" 2>/dev/null
+tries=0   # 等第一次 render 真的卡進 git 裡再砍它
+while [ ! -s "$WORK/git.log" ] && [ "$tries" -lt 100 ]; do sleep 0.1; tries=$((tries + 1)); done
+kill "$slow_pid" 2>/dev/null; wait "$slow_pid" 2>/dev/null
 SECONDS=0
 sl "$SLOWJ" PATH="$WORK/bin-slowgit" GIT_LOG="$WORK/git.log" SUSHI_NOW=$((NOW + 1)); clean
 has "$L2" '📁 repo | 🥢 X'
@@ -517,7 +527,8 @@ GH_STUB_OUT='2 1'
 t "GitHub 數量：gh 回了看不懂的東西 → 不顯示，也不會每次 render 都重試"
 BROKEN='{"cwd":"'"$REPO"'","model":{"display_name":"X"},"workspace":{"repo":{"host":"github.com","owner":"octo","name":"broken"}}}'
 GH_STUB_OUT='HTTP 401: Bad credentials'
-for _ in 1 2 3 4; do ghsl "$BROKEN"; sleep 0.15; done
+ghsl "$BROKEN"; wait_calls 'name=broken' 1
+for _ in 1 2 3; do ghsl "$BROKEN"; sleep 0.15; done
 clean; hasnt "$L2" 'issues:'
 eq "$(gh_calls 'name=broken')" 1
 GH_STUB_OUT='2 1'
@@ -569,8 +580,7 @@ piped=$(printf '%s' '{"cwd":"'"$P"'","workspace":{"repo":{"host":"github.com","o
     GH_LOG="$WORK/gh.log" GH_STUB_OUT='2 1' GH_STUB_SLEEP=3 "$BASH" "$SCRIPT" 2>&1)
 if [ "$SECONDS" -lt 2 ]; then ok; else no "render 等了 ${SECONDS} 秒"; fi
 has "$piped" '📁 proj | '
-tries=0   # 背景的 gh 是非同步啟動的，給它一點時間寫下呼叫紀錄
-while [ "$(gh_calls 'name=slow')" -lt 1 ] && [ "$tries" -lt 30 ]; do sleep 0.1; tries=$((tries + 1)); done
+wait_calls 'name=slow' 1
 eq "$(gh_calls 'name=slow')" 1
 
 # ═════════════════════════════════════════════════════════
@@ -666,7 +676,12 @@ eq "$(printf '{%s}' "$fragment" | jq -c . 2>&1)" "$(printf '%s' "$snippet" | jq 
 t "demo.sh：連續畫出畫面，收到結束訊號正常離開"
 "$BASH" "$ROOT/demo.sh" >"$WORK/demo.out" 2>&1 &
 demo_pid=$!
-sleep 1.5; kill -TERM "$demo_pid" 2>/dev/null; wait "$demo_pid"; eq "$?" 0
+tries=0   # 等它至少畫出一個畫面
+while [ "$tries" -lt 100 ]; do
+  case "$(cat "$WORK/demo.out" 2>/dev/null)" in *📁*) break ;; esac
+  sleep 0.1; tries=$((tries + 1))
+done
+kill -TERM "$demo_pid" 2>/dev/null; wait "$demo_pid"; eq "$?" 0
 has "$(cat "$WORK/demo.out")" '▸'
 has "$(cat "$WORK/demo.out")" '📁'
 
