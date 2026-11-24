@@ -81,7 +81,9 @@ Claude Code 的 status line 變成一條迴轉壽司輸送帶：每秒 🍣🍱�
 - **git 2.15 以上**（實測 2.25 – 2.54）。2.11 – 2.14 也能顯示，但不認得 `GIT_OPTIONAL_LOCKS`，render 時可能回寫 index。沒裝 git 也能跑，只是沒有 🌿
 - [`gh`](https://cli.github.com/)：選用，只有 `issues:N, PRs:M` 那一段會用到
 
-平常每次 render 啟動的外部行程只有 `jq` 一次，加上 bash 3.2 才需要的 `date`；`git` 預設 5 秒才問一次，其餘全是 bash 內建。`stat -f`、`sed -i ""` 這類 BSD-only 指令一概不用。
+CI 每次都在 Ubuntu、macOS（含內附的 bash 3.2）與 Alpine 上跑測試；Debian 13 與 Ubuntu 20.04（較舊的 jq 1.6、git 2.25）是用 Docker 手動跑的。
+
+每次 render 一定會啟動的外部行程只有 `jq` 一次，bash 3.2 再加上 `date`。快取過期的那一次（預設每 5 秒）才多 `git` 一次與 `mv` 兩次，其餘全是 bash 內建。`stat -f`、`sed -i ""` 這類 BSD-only 指令一概不用。
 
 唯一的平台分歧是把 unix epoch 格式化成時刻（🕐 和 `↻` 都要）：bash 4.2 以上有內建的 `printf '%(...)T'`，不用 fork，Linux 幾乎都走這條；macOS 內附的 bash 3.2 沒有，退回 `date`。而 BSD 的 `date -r <epoch>` 到了 GNU coreutils 與 busybox 是「讀檔案 mtime」，要改用 `date -d @<epoch>`，所以兩種都試：
 
@@ -206,8 +208,8 @@ jq -s '.[0] * .[1]' ~/.claude/settings.json <(./install.sh --json) > ~/.claude/s
 | `SUSHI_MARGIN` | `MARGIN` | `4` | 終端機寬度要扣掉的邊。`settings.json` 的 `statusLine` 有設 `padding` 的話，改成 `4 + 2 × padding` |
 | `SUSHI_DROP_ORDER` | `DROP_ORDER` | `time cost pr gh model rate ctx git` | 終端機太窄時，資訊列由左到右依序捨棄哪些段 |
 | `SUSHI_GIT_TTL` | `GIT_TTL` | `5` | git 狀態快取幾秒；`0` = 每次都問 git |
-| `SUSHI_GH` | `SHOW_GH` | `1` | `0` = 不查 GitHub 的 issue / PR 數量 |
-| `SUSHI_GH_TTL` | `GH_TTL` | `300` | GitHub 數量快取幾秒 |
+| `SUSHI_GH` | `SHOW_GH` | `1` | `1` = 查 GitHub 的 issue / PR 數量；`0`（或其他任何值）= 不查 |
+| `SUSHI_GH_TTL` | `GH_TTL` | `300` | GitHub 數量快取幾秒。最少 60：設得更小也當 60，免得變成每秒打一次 API |
 
 改完執行 `./demo.sh` 即時看效果（環境變數一樣吃：`SUSHI_EMPTY_PROB=30 ./demo.sh`）。
 
@@ -396,7 +398,7 @@ bash tests/run.sh        # 需要 jq、git、python3
 /bin/bash tests/run.sh   # macOS：指定用內附的 bash 3.2 跑
 ```
 
-測試餵受控的 JSON 給主腳本、檢查實際輸出：用 `SUSHI_NOW` 把時間釘住，`PATH` 只留腳本允許 fork 的指令，顯示寬度另外用 python3 的 `unicodedata` 量。CI 會在 Ubuntu 與 macOS 上各跑一次，並對所有腳本跑 shellcheck。
+測試餵受控的 JSON 給主腳本、檢查實際輸出：用 `SUSHI_NOW` 把時間釘住，`PATH` 只留腳本允許 fork 的指令，顯示寬度另外用 python3 的 `unicodedata` 量。CI 會在 Ubuntu、macOS 與 Alpine 上各跑一次，並對所有腳本跑 shellcheck。
 
 ---
 
@@ -413,7 +415,7 @@ sushi-status-line-cc/
 ├── demo.sh                    # 本機預覽，不動設定
 ├── tests/
 │   └── run.sh                 # 測試
-├── .github/workflows/ci.yml   # shellcheck + 測試（Ubuntu、macOS）
+├── .github/workflows/ci.yml   # shellcheck + 測試（Ubuntu、macOS、Alpine）
 └── assets/
     ├── demo.gif               # README 頂端的動畫
     └── demo.tape              # vhs 錄 GIF 腳本
