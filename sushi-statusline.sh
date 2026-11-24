@@ -3,8 +3,8 @@
 # 每秒 L→R 滾動的迴轉壽司 status line。
 # Docs: see README.md in the same folder.
 #
-# 每次 render 最多 fork：jq 一次、git 一次（有快取，預設 5 秒才問一次）、
-# date 一到兩次（只有 bash < 4.2 需要）。其餘全部是 bash 內建。
+# 外部行程：每次 render 一定有 jq 一次；bash < 4.2 再加 date（現在時間一次、有重設時間再一次）。
+# 快取過期的那一次（預設每 5 秒）多 git 一次與 mv 兩次。其餘全部是 bash 內建。
 
 # Claude Code 把終端機寬度放在 COLUMNS。bash 可能在跑完外部指令後自己改寫它，
 # 所以趁還沒 fork 任何東西先抄下來。
@@ -23,7 +23,7 @@ EMPTY_PROB=${SUSHI_EMPTY_PROB:-65}    # % 空格機率（越高越稀疏）
 MARGIN=${SUSHI_MARGIN:-4}             # 終端機寬度要扣掉的邊。settings.json 有設 padding 就再加 2×padding
 GIT_TTL=${SUSHI_GIT_TTL:-5}           # git 狀態快取秒數；0 = 每次都問 git
 SHOW_GH=${SUSHI_GH:-1}                # 1 = 用 gh 查 GitHub 的 open issue / PR 數量；0 = 關掉
-GH_TTL=${SUSHI_GH_TTL:-300}           # GitHub 數量快取秒數
+GH_TTL=${SUSHI_GH_TTL:-300}           # GitHub 數量快取秒數（最少 60）
 # 終端機太窄時，資訊列依這個順序一次拿掉一段（📁 永遠留著）
 DROP_ORDER=${SUSHI_DROP_ORDER:-time cost pr gh model rate ctx git}
 # 🍣 壽司 emoji 池，自行替換口味（每個都要是 2 欄寬的 emoji）
@@ -44,7 +44,8 @@ uint "$EMPTY_PROB" 65;    EMPTY_PROB=$REPLY
 uint "$MARGIN" 4;         MARGIN=$REPLY
 uint "$GIT_TTL" 5;        GIT_TTL=$REPLY
 uint "$GH_TTL" 300;       GH_TTL=$REPLY
-[ "$SLOTS_VISIBLE" -gt 1000 ] && SLOTS_VISIBLE=1000
+# 和 GIT_TTL 不同，這個沒有「0 = 不快取」：那等於每次 render 打一次 GitHub API，幾十分鐘就把額度用完
+[ "$GH_TTL" -lt 60 ] && GH_TTL=60
 
 # ═══════════════════════════════════════════
 # 時間
@@ -63,7 +64,7 @@ uint "${SUSHI_NOW:-}" ""
 if [ -n "$REPLY" ]; then                # SUSHI_NOW：把「現在」釘在指定的 epoch（測試、截圖用）
   NOW=$REPLY; fmt_time '%H:%M:%S' "$NOW"; CLOCK=$REPLY
 else
-  printf -v REPLY '%(%s %H:%M:%S)T' -1 2>/dev/null || REPLY=$(date '+%s %H:%M:%S')
+  printf -v REPLY '%(%s %H:%M:%S)T' -1 2>/dev/null || REPLY=$(date '+%s %H:%M:%S' 2>/dev/null)
   NOW=${REPLY%% *}; CLOCK=${REPLY#* }
 fi
 uint "$NOW" 0; NOW=$REPLY
@@ -76,8 +77,8 @@ uint "$NOW" 0; NOW=$REPLY
 #     也一併處理，資料夾名稱之類的外來字串不能拿來操控終端機
 #   · 欄位不存在或型別不對一律當成沒有（at 會吞掉 getpath 的錯誤）
 #   · 目錄給兩欄：CWD_SHOW 是濾過、拿來顯示的；CWD 是原樣、拿來問檔案系統的。兩者不能混用——
-#     濾過的路徑可能剛好是另一個真實存在的目錄。路徑裡有換行這類字元時沒辦法一行送過來，
-#     CWD 就留空（等於不查 git），而不是送一個改過的路徑。
+#     濾過的路徑可能剛好是另一個真實存在的目錄。路徑裡有換行時沒辦法一行送過來，
+#     CWD 就留空（等於不查 git），而不是送一個改過的路徑。tab 之類的其他字元照原樣送。
 # ═══════════════════════════════════════════
 {
   IFS= read -r CWD_SHOW; IFS= read -r CWD
@@ -97,7 +98,7 @@ uint "$NOW" 0; NOW=$REPLY
                      then 32 else . end)
                | implode )
              else "" end;
-  def path:  if type == "string" and (explode | all(. >= 32 and . != 127)) then . else "" end;
+  def path:  if type == "string" and (explode | all(. != 10 and . != 0)) then . else "" end;
   def num:   if type == "number" then . else 0 end;
   def int:   if type == "number" then (. + 0.5 | floor) else "" end;
 
@@ -166,6 +167,8 @@ if [ "$MAX_W" -gt 0 ]; then
 elif [ "$SLOTS" -eq 0 ]; then
   SLOTS=30
 fi
+# 上限 1000 格（約 3000 欄）：COLUMNS 要是傳來一個離譜的數字，幾萬格算下來會超過 refreshInterval
+[ "$SLOTS" -gt 1000 ] && SLOTS=1000
 [ "$NUM_SUSHI" -eq 0 ] && EMPTY_PROB=100
 
 BELT="▸"
@@ -216,7 +219,10 @@ have_cache() {
 # （2>/dev/null 放前面：轉向由左至右生效，開檔失敗的訊息才會被吃掉）
 put() {
   local file=$1; shift
-  printf '%s\n' "$@" 2>/dev/null >"$file~$$" && mv -f "$file~$$" "$file" 2>/dev/null
+  printf '%s\n' "$@" 2>/dev/null >"$file~$$" || return 1
+  mv -f "$file~$$" "$file" 2>/dev/null && return 0
+  rm -f "$file~$$" 2>/dev/null   # mv 失敗就把暫存檔收掉：檔名帶 PID，放著不管每次 render 都會多一個
+  return 1
 }
 
 # ── 🌿 git ──
@@ -259,6 +265,7 @@ STALE=""   # 同一個目錄上一次的結果，過期了但還能先頂著用
 if [ -n "$GIT_CACHE" ] && [ -f "$GIT_CACHE" ]; then
   C_TS=""; C_DIR=""; C_INFO=""
   { IFS= read -r C_TS; IFS= read -r C_DIR; IFS= read -r C_INFO; } 2>/dev/null <"$GIT_CACHE"
+  strip_ctl "$C_INFO"; C_INFO=$REPLY   # 凡是要印出來的都過一次濾網，快取檔也不例外
   uint "$C_TS" ""
   if [ -n "$REPLY" ] && [ "$C_DIR" = "$CWD" ]; then
     STALE=$C_INFO
@@ -359,7 +366,8 @@ SEG_MODEL="🥢 $MODEL"
 SEG_COST="💰\$$COST"
 SEG_CTX="📐${CTX_PCT}%"
 SEG_RATE=$RATE_INFO
-SEG_TIME="🕐$CLOCK"
+SEG_TIME=""
+[ -n "$CLOCK" ] && SEG_TIME="🕐$CLOCK"   # 時間格式化不出來（舊 bash 又沒有 date）就整段不顯示
 if [ -n "$NOTE" ]; then SEG_MODEL=$NOTE; SEG_COST=""; SEG_CTX=""; fi
 
 # ═══════════════════════════════════════════
