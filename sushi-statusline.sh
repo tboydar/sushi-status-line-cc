@@ -75,9 +75,13 @@ uint "$NOW" 0; NOW=$REPLY
 #   · 字串裡的控制字元換成空白：值裡有換行也不會多出一行；C1（U+0080–9F）與雙向覆寫字元
 #     也一併處理，資料夾名稱之類的外來字串不能拿來操控終端機
 #   · 欄位不存在或型別不對一律當成沒有（at 會吞掉 getpath 的錯誤）
+#   · 目錄給兩欄：CWD_SHOW 是濾過、拿來顯示的；CWD 是原樣、拿來問檔案系統的。兩者不能混用——
+#     濾過的路徑可能剛好是另一個真實存在的目錄。路徑裡有換行這類字元時沒辦法一行送過來，
+#     CWD 就留空（等於不查 git），而不是送一個改過的路徑。
 # ═══════════════════════════════════════════
 {
-  IFS= read -r CWD;      IFS= read -r MODEL;    IFS= read -r SESSION
+  IFS= read -r CWD_SHOW; IFS= read -r CWD
+  IFS= read -r MODEL;    IFS= read -r SESSION
   IFS= read -r COST_E4;  IFS= read -r CTX_PCT
   IFS= read -r RATE_5H;  IFS= read -r RESET_5H
   IFS= read -r RATE_7D;  IFS= read -r RESET_7D
@@ -93,10 +97,13 @@ uint "$NOW" 0; NOW=$REPLY
                      then 32 else . end)
                | implode )
              else "" end;
+  def path:  if type == "string" and (explode | all(. >= 32 and . != 127)) then . else "" end;
   def num:   if type == "number" then . else 0 end;
   def int:   if type == "number" then (. + 0.5 | floor) else "" end;
 
-  ((at(["workspace", "current_dir"]) | strings) // at(["cwd"]) | text),
+  ((at(["workspace", "current_dir"]) | strings) // at(["cwd"])) as $cwd
+  | ($cwd | text),
+  ($cwd | path),
   (at(["model", "display_name"]) | text),
   (at(["session_id"]) | text),
   (at(["cost", "total_cost_usd"]) | num * 10000 | int),
@@ -129,7 +136,7 @@ if [ -z "$COST_E4" ]; then
   command -v jq >/dev/null 2>&1 || NOTE="❗ 找不到 jq，請先安裝"
 fi
 [ -z "$MODEL" ] && MODEL="N/A"
-[ -z "$CWD" ] && CWD=$PWD
+if [ -z "$CWD_SHOW" ]; then CWD=$PWD; CWD_SHOW=$PWD; fi   # 輸入沒給目錄：用自己所在的目錄
 
 uint "$COST_E4" 0;   COST_E4=$REPLY
 uint "$CTX_PCT" 0;   CTX_PCT=$REPLY
@@ -182,8 +189,19 @@ BELT+="▸"
 # ═══════════════════════════════════════════
 # 資訊列各段
 # ═══════════════════════════════════════════
-FOLDER=${CWD%"${CWD##*[!/]}"}   # 去掉尾端所有的 /
+# strip_ctl 字串 → REPLY：拿掉會操控終端機的字元。資料夾與分支名稱都可能來自陌生的 repo。
+#   C0 與 DEL；C1（UTF-8 的 C2 80–9F，有些終端機把 U+009B 當成 ESC [）；
+#   雙向控制字元（E2 80 8E/8F/AA–AE、E2 81 A6–A9，能把畫面上的順序弄反）
+strip_ctl() {
+  REPLY=${1//[$'\x01'-$'\x1F\x7F']/}
+  REPLY=${REPLY//$'\xC2'[$'\x80'-$'\x9F']/}
+  REPLY=${REPLY//$'\xE2\x80'[$'\x8E\x8F\xAA'-$'\xAE']/}
+  REPLY=${REPLY//$'\xE2\x81'[$'\xA6'-$'\xA9']/}
+}
+
+FOLDER=${CWD_SHOW%"${CWD_SHOW##*[!/]}"}   # 去掉尾端所有的 /
 FOLDER=${FOLDER##*/}
+strip_ctl "$FOLDER"; FOLDER=$REPLY       # jq 那邊濾過了，但退回 $PWD 時沒有經過 jq
 [ -z "$FOLDER" ] && FOLDER=/
 
 # 快取放在自己擁有的目錄裡。/tmp 是共用的，別人先建好的同名目錄或 symlink 一律不用。
@@ -204,11 +222,12 @@ put() {
 # ── 🌿 git ──
 # 一次 git status 拿到分支和所有變動（同一個檔案又暫存又再改只算一次）。
 # GIT_OPTIONAL_LOCKS=0：不順手回寫 index，每秒 render 才不會和 Claude 正在跑的 git 搶 index.lock。
-# core.fsmonitor=false：repo 自己的 .git/config 可以把 fsmonitor 設成任意指令，git status 會去執行它；
-# 這裡是無人看管、每幾秒自動跑一次，不該替一個剛解壓縮的專案執行它指定的程式。
+# core.fsmonitor=false：repo 自己的 .git/config 可以把 fsmonitor 設成任意指令，git status 會去執行它。
+# 這只關掉最容易被利用的一條路，不是完整的防護：clean filter 等設定一樣會被 git 執行
+# （關掉 filter 會讓 Git LFS 的檔案全部被算成已修改）。來路不明的 .git 目錄本來就不該拿來跑 git。
 git_info() {
   GIT_INFO=""
-  [ -d "$CWD" ] || return 0
+  [ -n "$CWD" ] && [ -d "$CWD" ] || return 0
   local line branch="" oid="" dirty=0
   while IFS= read -r line; do
     case $line in
@@ -223,11 +242,8 @@ git_info() {
              status --porcelain=v2 --branch --untracked-files=all 2>/dev/null)
   [ -n "$branch" ] || return 0   # 不是 git repo（或沒裝 git）
   [ "$branch" = "(detached)" ] && branch=${oid:0:7}
-  # git 不准分支名有 ASCII 控制字元，但准 C1 控制字元（C2 80–9F）與雙向覆寫字元（E2 80 8E/8F/AA–AE、E2 81 A6–A9）
-  branch=${branch//$'\xC2'[$'\x80'-$'\x9F']/}
-  branch=${branch//$'\xE2\x80'[$'\x8E\x8F\xAA'-$'\xAE']/}
-  branch=${branch//$'\xE2\x81'[$'\xA6'-$'\xA9']/}
-  GIT_INFO="🌿 $branch"
+  strip_ctl "$branch"   # git 只擋 ASCII 控制字元，C1 與雙向控制字元都進得了分支名
+  GIT_INFO="🌿 $REPLY"
   if [ "$dirty" -ge 1000 ]; then GIT_INFO="$GIT_INFO (+999+)"
   elif [ "$dirty" -gt 0 ]; then GIT_INFO="$GIT_INFO (+$dirty)"; fi
 }
@@ -276,20 +292,23 @@ if [ "$SHOW_GH" = 1 ] && [ "$GH_HOST" = github.com ] && [ -n "$GH_OWNER" ] && [ 
         uint "$G_PRS" "";    G_PRS=$REPLY
         [ -n "$G_ISSUES" ] && [ -n "$G_PRS" ] && GH_INFO="issues:${G_ISSUES}, PRs:${G_PRS}"
         if [ $((NOW - G_TS)) -ge "$GH_TTL" ] || [ $((NOW - G_TS)) -lt 0 ]; then
-          # 先把時間戳更新（數字沿用舊的），之後的 render 和其他 session 就不會重複去查；
-          # 查詢失敗也一樣等 GH_TTL 才重試。
-          put "$GH_CACHE" "$NOW ${G_ISSUES:--} ${G_PRS:--}"
-          # stdio 全部切斷再丟背景：status line 不等網路，Claude Code 也不會等這個子行程
-          (
-            # shellcheck disable=SC2016  # $owner / $name 是 GraphQL 變數，不是 shell 變數
-            # -f 而不是 -F：-F 會把 123 這種名字當成數字送出去，GraphQL 的 String! 不收
-            counts=$(gh api graphql -f owner="$GH_OWNER" -f name="$GH_NAME" -f query='
-              query($owner:String!,$name:String!){repository(owner:$owner,name:$name){
-                issues(states:OPEN){totalCount} pullRequests(states:OPEN){totalCount}}}' \
-              --jq '"\(.data.repository.issues.totalCount) \(.data.repository.pullRequests.totalCount)"')
-            [[ $counts =~ ^[0-9]+\ [0-9]+$ ]] || exit 0
-            put "$GH_CACHE" "$NOW $counts"
-          ) </dev/null >/dev/null 2>&1 &
+          # 先把時間戳更新（數字沿用舊的），之後的 render 和其他 session 就不會重複去查。
+          # 佔位寫成功才去查：快取寫不進去（磁碟滿、目錄唯讀）還照查的話，每次 render 都會打一次 API。
+          if put "$GH_CACHE" "$NOW ${G_ISSUES:--} ${G_PRS:--}"; then
+            # stdio 全部切斷再丟背景：status line 不等網路，Claude Code 也不會等這個子行程。
+            # （不能寫成 put … && ( … ) &：那樣進背景的是整串 &&，外層的子 shell 還握著 stdout）
+            (
+              # shellcheck disable=SC2016  # $owner / $name 是 GraphQL 變數，不是 shell 變數
+              # -f 而不是 -F：-F 會把 123 這種名字當成數字送出去，GraphQL 的 String! 不收
+              counts=$(gh api graphql -f owner="$GH_OWNER" -f name="$GH_NAME" -f query='
+                query($owner:String!,$name:String!){repository(owner:$owner,name:$name){
+                  issues(states:OPEN){totalCount} pullRequests(states:OPEN){totalCount}}}' \
+                --jq '"\(.data.repository.issues.totalCount) \(.data.repository.pullRequests.totalCount)"')
+              # 查不到（沒登入、沒網路、沒權限）：把舊數字清掉，不拿過期的數字繼續顯示；等 GH_TTL 再試
+              [[ $counts =~ ^[0-9]+\ [0-9]+$ ]] || counts="- -"
+              put "$GH_CACHE" "$NOW $counts"
+            ) </dev/null >/dev/null 2>&1 &
+          fi
         fi
       fi
       ;;
