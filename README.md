@@ -108,8 +108,8 @@ fmt_time() {
 這個 status line 只適用於 [Claude Code](https://claude.com/product/claude-code)（Anthropic 官方 CLI）。還沒有的話：
 
 ```bash
-# macOS / Linux
-curl -fsSL https://claude.com/claude-code/install.sh | bash
+# macOS / Linux / WSL
+curl -fsSL https://claude.ai/install.sh | bash
 ```
 
 裝好後執行 `claude` 開第一個 session，確認能跑就 `exit` 離開。
@@ -178,6 +178,8 @@ cd ~/.claude/hud/sushi
 }
 ```
 
+repo 裡的 `settings.example.json` 就是這份最小範例；把 `command` 換成你的實際絕對路徑即可。
+
 `install.sh` 本身不會動你的設定檔。不想手動貼的話，`./install.sh --json` 只印出 JSON 物件，可以自己交給 jq 合併（先備份）：
 
 ```bash
@@ -189,6 +191,12 @@ jq -s '.[0] * .[1]' ~/.claude/settings.json <(./install.sh --json) > ~/.claude/s
 ### 6. 重啟 Claude Code
 
 關掉現有 session（`exit`）然後重新 `claude`，壽司帶就會出現在底部。
+
+### 停用或移除
+
+1. 從 `~/.claude/settings.json` 移除最上層的 `"statusLine"` 設定並存檔。
+2. 刪掉 clone 下來的目錄即可；`install.sh` 沒有改過其他設定。
+3. 執行期快取在 `${TMPDIR:-/tmp}/sushi-statusline-<uid>/`，刪掉不影響 Claude Code 本身。
 
 ---
 
@@ -410,7 +418,7 @@ sushi-status-line-cc/
 ├── LICENSE                    # MIT
 ├── .gitignore
 ├── sushi-statusline.sh        # 主腳本
-├── settings.example.json      # settings.json 設定片段範例
+├── settings.example.json      # settings.json 最小完整範例
 ├── install.sh                 # 印出待貼 JSON（不自動改設定）
 ├── demo.sh                    # 本機預覽，不動設定
 ├── tests/

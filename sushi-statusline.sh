@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 🍣 Sushi Conveyor Belt Status Line for Claude Code
 # 每秒 L→R 滾動的迴轉壽司 status line。
-# Docs: see README.md in the same folder.
+# 文件：見同目錄的 README.md。
 #
 # 外部行程：每次 render 一定有 jq 一次；bash < 4.2 再加 date（現在時間一次、有重設時間再一次）。
 # 快取過期的那一次（預設每 5 秒）多 git 一次與 mv 兩次。其餘全部是 bash 內建。
@@ -16,7 +16,7 @@ export LC_ALL=C
 set -f   # 不做檔名展開：下面有幾處刻意不加引號來切字
 
 # ═══════════════════════════════════════════
-# Tunables — 直接改預設值，或用 SUSHI_* 環境變數覆寫（不必動這個檔案）
+# 可調參數 — 直接改預設值，或用 SUSHI_* 環境變數覆寫（不必動這個檔案）
 # ═══════════════════════════════════════════
 SLOTS_VISIBLE=${SUSHI_SLOTS:-0}       # 帶子格數；0 = 自動貼齊終端機寬度（拿不到寬度時 30 格）
 EMPTY_PROB=${SUSHI_EMPTY_PROB:-65}    # % 空格機率（越高越稀疏）
